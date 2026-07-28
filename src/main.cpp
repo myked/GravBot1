@@ -222,6 +222,12 @@ void loop() {
     float rightFrontMMs = ticksToMMs(rf, dt);
     float rightRearMMs  = ticksToMMs(rr, dt);
 
+    // String line = " leftFrontMMs:" + String(leftFrontMMs) +
+    //               " leftRearMMs:" + String(leftRearMMs) +
+    //               " rightFrontMMs:" + String(rightFrontMMs) +
+    //               " rightRearMMs:" + String(rightRearMMs);
+    // printBoth(line);
+
     // Use the average of front+rear per side as the PID feedback signal
     float leftSpeedMMs  = (leftFrontMMs + leftRearMMs) / 2.0;
     float rightSpeedMMs = (rightFrontMMs + rightRearMMs) / 2.0;
@@ -244,6 +250,8 @@ void loop() {
                   " LR:" + String(leftRearMMs) +
                   " RF:" + String(rightFrontMMs) +
                   " RR:" + String(rightRearMMs) +
+                  " leftSpeedMMs:" + String(leftSpeedMMs) +
+                  " rightSpeedMMs:" + String(rightSpeedMMs) +
                   " Lpwm:" + String(leftPWM) +
                   " Rpwm:" + String(rightPWM);
     if (leftSlip)  line += " [LEFT SLIP]";
