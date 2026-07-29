@@ -15,9 +15,39 @@
   Left  REAR  B -> pin 6   (plain digital input)
   Right REAR  A -> pin 12  (PCINT, pin-change interrupt group)
   Right REAR  B -> pin 7   (plain digital input)
-  Sabertooth S1 (left side)  -> pin 9  (PWM out from Arduino)
-  Sabertooth S2 (right side) -> pin 10 (PWM out from Arduino)
+  Sabertooth S2 (left side)  -> pin 10 (PWM out from Arduino)
+  Sabertooth S1 (right side) -> pin 9  (PWM out from Arduino)
   Arduino GND -> Sabertooth 0V
+
+  NOTE: confirmed by bench test that pin 9 drives the Sabertooth's
+  right-side output and pin 10 drives the left-side output - opposite
+  of what the S1/S2 labeling might suggest. If you rewire the
+  Sabertooth screw terminals so S1=left/S2=right, swap the pin numbers
+  in saberLeft.attach()/saberRight.attach() below to match.
+
+  STABILITY FIXES (from staged bring-up in src/stages/) - see those
+  files for the full investigation:
+    1. DIP switches must be firmly seated in Independent mode. A half
+       seated switch silently runs Mixed mode instead, where one
+       Sabertooth input becomes "throttle" and the other becomes
+       "turn" - both wheels then react to both PID loops at once,
+       which reads exactly like uncontrollable oscillation.
+    2. Right-side encoders read NEGATIVE for forward rotation (mirror-
+       mounted relative to left) - see RIGHT_SIGN below. Without this,
+       the right PID loop sees inverted feedback and fights itself.
+    3. PID output is now slew-rate limited (MAX_PWM_STEP_PER_CYCLE) -
+       without it, a single noisy reading can slam the motor from
+       full-forward to full-reverse in one 50ms step, and that abrupt
+       reversal induces real electrical/mechanical noise that
+       corrupts the next reading too - a self-sustaining feedback
+       loop, which was the root cause of the original wild instability.
+    4. Below ~100us PWM offset this drivetrain sits in a stochastic
+       dead zone (see MIN_RELIABLE_PWM_OFFSET) - the deadband
+       compensation in computePID() snaps any nonzero-target output up
+       to that floor rather than letting it hover in the unreliable
+       zone. It's guarded to only apply when the target is actually
+       nonzero, so the robot still coasts to a genuine stop at
+       target=0 instead of jittering.
 
   HC-05 Bluetooth (wireless tuning from Android):
   HC-05 VCC -> Uno 5V
@@ -69,12 +99,26 @@ const float WHEEL_DIAMETER_MM = 120.0;   // confirm with calipers
 const float WHEEL_CIRCUMF_MM  = 3.14159265 * WHEEL_DIAMETER_MM;
 
 // Target crawl speed, mm/s. Positive = forward, negative = reverse.
-float targetSpeedMMs = 30.0;
+// NOTE: the original design value here was 30.0, but calibration found
+// this drivetrain can't reliably hold speeds that low - see
+// MIN_RELIABLE_PWM_OFFSET. 500 is validated (src/stages/stage4_full_dual_pid.cpp)
+// to track with bounded, safe PWM output. Expect some oscillation around
+// the target (tens up to ~1000mm/s) rather than a perfectly smooth hold -
+// tried raising Kp/Ki and loosening the slew-rate limit to tighten this,
+// none helped (loosening the slew limit made it worse - it turned out to
+// be usefully damping the oscillation, not just holding back convergence).
+// Tightening further would need sensor filtering, not just gain tuning.
+float targetSpeedMMs = 500.0;
 
-// PID gains - start conservative, tune on your actual robot
-float Kp = 0.9;
-float Ki = 0.4;
-float Kd = 0.02;
+// PID gains - the original 0.9/0.4/0.02 here were an untested guess and
+// caused the instability documented above. Reset to the Kp-only, low
+// starting point validated in src/stages/stage3_single_side_pid.cpp and
+// stage4_full_dual_pid.cpp; raise Kp first, then add small Ki/Kd per the
+// TUNING note below, watching for the slew-limited Lpwm/Rpwm staying
+// bounded rather than banging between PWM_MIN/PWM_MAX.
+float Kp = 0.3;
+float Ki = 0.0;
+float Kd = 0.0;
 
 // Sabertooth PWM output limits (microseconds), 1500 = stop
 const int PWM_STOP = 1500;
@@ -83,6 +127,24 @@ const int PWM_MAX  = 2000;
 
 // Minimum "kick" offset (us) to overcome stiction when starting from rest
 const int STICTION_KICK = 40;
+
+// Calibrated by bisecting open-loop PWM offsets on the left side (see
+// src/stages/stage2_open_loop_drive.cpp). Below ~100us from PWM_STOP, this
+// drivetrain sits in a STOCHASTIC dead zone: the same commanded PWM
+// sometimes stalls (gear backlash twitch only) and sometimes breaks free
+// into a full, steady spin (~1500mm/s) on different trials - static
+// friction, not something further PID tuning can fix. 1600us (100us
+// offset) reliably produced sustained, repeatable rotation across
+// multiple tests. Treat this as the practical floor for continuous PWM
+// drive; a genuinely slower crawl would need PWM dithering (short pulses
+// at/above this floor, separated by stops) rather than a lower duty
+// cycle held continuously.
+const int MIN_RELIABLE_PWM_OFFSET = 100;
+
+// Max change in written PWM per control cycle (us). Caps how fast the
+// output can swing regardless of what the PID computes - see
+// STABILITY FIXES #3 above.
+const int MAX_PWM_STEP_PER_CYCLE = 20;
 
 // If front/rear speed on a side differ by more than this, flag slip
 const float SLIP_THRESHOLD_MMS = 15.0;
@@ -102,6 +164,10 @@ float slipCorrectionGain  = 0.0;
 
 // How often the control loop runs
 const unsigned long CONTROL_PERIOD_MS = 50; // 20 Hz
+
+// Right side reads negative for forward rotation (mirror-mounted
+// relative to left) - see STABILITY FIXES #2 above.
+const int RIGHT_SIGN = -1;
 
 // ---------------- PIN CONFIG ----------------
 
@@ -152,6 +218,8 @@ struct PID {
 PID leftPID, rightPID;
 
 unsigned long lastControlTime = 0;
+int lastAppliedLeftPWM = PWM_STOP;
+int lastAppliedRightPWM = PWM_STOP;
 
 // ---------------- FUNCTION PROTOTYPES ----------------
 // Declared here so they're known before use in loop(), rather than
@@ -160,6 +228,7 @@ unsigned long lastControlTime = 0;
 float ticksToMMs(long ticks, float dt);
 int computePID(PID &state, float target, float measured, float dt);
 int applySlipCorrection(int pwm, float frontMMs, float rearMMs);
+int slewLimit(int rawPWM, int &lastApplied);
 void printBoth(const String &line);
 
 // ---------------- SETUP ----------------
@@ -183,8 +252,8 @@ void setup() {
   PCMSK0 |= (1 << PCINT3) | (1 << PCINT4);
   lastPINB = PINB;
 
-  saberLeft.attach(9);
-  saberRight.attach(10);
+  saberLeft.attach(10);
+  saberRight.attach(9);
   saberLeft.writeMicroseconds(PWM_STOP);
   saberRight.writeMicroseconds(PWM_STOP);
   delay(500);
@@ -217,6 +286,9 @@ void loop() {
     lfTicks = rfTicks = lrTicks = rrTicks = 0;
     interrupts();
 
+    rf *= RIGHT_SIGN;
+    rr *= RIGHT_SIGN;
+
     float leftFrontMMs  = ticksToMMs(lf, dt);
     float leftRearMMs   = ticksToMMs(lr, dt);
     float rightFrontMMs = ticksToMMs(rf, dt);
@@ -241,6 +313,9 @@ void loop() {
 
     leftPWM  = applySlipCorrection(leftPWM,  leftFrontMMs,  leftRearMMs);
     rightPWM = applySlipCorrection(rightPWM, rightFrontMMs, rightRearMMs);
+
+    leftPWM  = slewLimit(leftPWM,  lastAppliedLeftPWM);
+    rightPWM = slewLimit(rightPWM, lastAppliedRightPWM);
 
     saberLeft.writeMicroseconds(leftPWM);
     saberRight.writeMicroseconds(rightPWM);
@@ -308,5 +383,25 @@ int computePID(PID &state, float target, float measured, float dt) {
     pwm += (output > 0) ? STICTION_KICK : -STICTION_KICK;
   }
 
+  // Deadband compensation - only when we actually want motion (nonzero
+  // target), otherwise a tiny residual-noise correction while trying to
+  // sit at target=0 would get blown up into a full-strength drive
+  // command. See STABILITY FIXES #4 above.
+  int offset = pwm - PWM_STOP;
+  if (fabs(target) > 0.1 && offset != 0 && abs(offset) < MIN_RELIABLE_PWM_OFFSET) {
+    pwm = PWM_STOP + (offset > 0 ? MIN_RELIABLE_PWM_OFFSET : -MIN_RELIABLE_PWM_OFFSET);
+  }
+
   return constrain(pwm, PWM_MIN, PWM_MAX);
+}
+
+// Caps how much the written PWM can change in one control cycle,
+// regardless of what computePID/applySlipCorrection want - see
+// STABILITY FIXES #3 above.
+int slewLimit(int rawPWM, int &lastApplied) {
+  int applied = constrain(rawPWM, lastApplied - MAX_PWM_STEP_PER_CYCLE,
+                                    lastApplied + MAX_PWM_STEP_PER_CYCLE);
+  applied = constrain(applied, PWM_MIN, PWM_MAX);
+  lastApplied = applied;
+  return applied;
 }
