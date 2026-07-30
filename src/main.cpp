@@ -125,6 +125,27 @@ const float WHEEL_CIRCUMF_MM  = 3.14159265 * WHEEL_DIAMETER_MM;
 // Tightening further would need sensor filtering, not just gain tuning.
 float targetSpeedMMs = 500.0;
 
+// Steering bias, mm/s. Positive = right turn (left side sped up relative
+// to right), negative = left turn. leftTarget = targetSpeedMMs -
+// turnRateMMs, rightTarget = targetSpeedMMs + turnRateMMs. Set via the
+// second number on the serial command line, e.g. "500 100" - the turn
+// value is optional, defaults to 0 (straight) if omitted.
+float turnRateMMs = 0.0;
+
+// Speed/turn magnitudes used for single-character RC app commands (see
+// handleRcChar() below) - matches the "Bluetooth RC Controller" app's
+// default F/B/L/R/G/H/I/J/S protocol. The app streams the same character
+// continuously while a direction is held, so holding F/B (or a diagonal)
+// ramps targetSpeedMMs up/down by RC_SPEED_STEP_MMS each time the
+// character repeats, up to the RC_SPEED_MMS ceiling - rather than
+// jumping straight there. L/R stay an instant pivot turn (targetSpeedMMs
+// forced to 0, turnRateMMs set directly), a separate action from
+// throttle. None of these three have been bench tuned yet - if the ramp
+// feels too fast/slow or turns too sharp/soft, adjust them.
+const float RC_SPEED_MMS      = 2000.0; // ceiling for the held-throttle ramp
+const float RC_SPEED_STEP_MMS = 40.0;   // added/subtracted per repeat while held
+const float RC_TURN_MMS       = 200.0; // fixed turn bias, applied instantly
+
 // PID gains - the original 0.9/0.4/0.02 here were an untested guess and
 // caused the instability documented above. Reset to the Kp-only, low
 // starting point validated in src/stages/stage3_single_side_pid.cpp and
@@ -234,6 +255,7 @@ float ticksToMMs(long ticks, float dt);
 int computePID(PID &state, float target, float measured, float dt);
 int applySlipCorrection(int pwm, float frontMMs, float rearMMs);
 int slewLimit(int rawPWM, int &lastApplied);
+bool handleRcChar(int c);
 
 // ---------------- SETUP ----------------
 
@@ -259,7 +281,9 @@ void setup() {
   saberRight.writeMicroseconds(PWM_STOP);
   delay(500);
 
-  Serial.println("Ready. Send a number to set target speed in mm/s (negative = reverse).");
+  Serial.println("Ready. Send speed in mm/s, optionally followed by a turn rate,");
+  Serial.println("e.g. \"500\" for straight or \"500 100\" to bias right (negative = reverse/left).");
+  Serial.println("Or drive with the Bluetooth RC Controller app (F/B/L/R/G/H/I/J/S).");
   lastControlTime = millis();
 }
 
@@ -267,16 +291,32 @@ void setup() {
 
 void loop() {
   if (Serial.available()) {
-    targetSpeedMMs = Serial.parseFloat();
+    if (!handleRcChar(Serial.peek())) {
+      // Not an RC app character - fall back to the typed "speed [turn]"
+      // format used by a plain terminal app.
+      targetSpeedMMs = Serial.parseFloat();
+
+      // Turn rate is optional - a bare "500" should set turnRateMMs=0
+      // without a long stall. parseFloat() blocks up to Serial's timeout
+      // (default 1000ms) waiting for a digit when the buffer's empty, so
+      // shorten it here: a turn value sent right after the speed value is
+      // already buffered and reads back near-instantly, but nothing to
+      // read isn't worth waiting a full second for.
+      unsigned long defaultTimeout = Serial.getTimeout();
+      Serial.setTimeout(50);
+      turnRateMMs = Serial.parseFloat();
+      Serial.setTimeout(defaultTimeout);
+    }
+
     // Drain any trailing CR/LF left behind by the sender (some terminal
     // apps send \r\n rather than a single terminator) - otherwise the
     // leftover byte trips Serial.available() again next loop, and a
-    // second parseFloat() call with nothing but whitespace to read
-    // times out and silently overwrites targetSpeedMMs back to 0.
+    // stray re-parse silently overwrites these values back to 0.
     while (Serial.available() && (Serial.peek() == '\n' || Serial.peek() == '\r')) {
       Serial.read();
     }
-    Serial.println("New target speed (mm/s): " + String(targetSpeedMMs));
+    Serial.println("New target speed (mm/s): " + String(targetSpeedMMs) +
+                    "  turn rate (mm/s): " + String(turnRateMMs));
   }
 
   unsigned long now = millis();
@@ -297,12 +337,6 @@ void loop() {
     float rightFrontMMs = ticksToMMs(rf, dt);
     float rightRearMMs  = ticksToMMs(rr, dt);
 
-    // String line = " leftFrontMMs:" + String(leftFrontMMs) +
-    //               " leftRearMMs:" + String(leftRearMMs) +
-    //               " rightFrontMMs:" + String(rightFrontMMs) +
-    //               " rightRearMMs:" + String(rightRearMMs);
-    // Serial.println(line);
-
     // Use the average of front+rear per side as the PID feedback signal
     float leftSpeedMMs  = (leftFrontMMs + leftRearMMs) / 2.0;
     float rightSpeedMMs = (rightFrontMMs + rightRearMMs) / 2.0;
@@ -311,8 +345,11 @@ void loop() {
     bool leftSlip  = fabs(leftFrontMMs - leftRearMMs) > SLIP_THRESHOLD_MMS;
     bool rightSlip = fabs(rightFrontMMs - rightRearMMs) > SLIP_THRESHOLD_MMS;
 
-    int leftPWM  = computePID(leftPID,  targetSpeedMMs, leftSpeedMMs, dt);
-    int rightPWM = computePID(rightPID, targetSpeedMMs, rightSpeedMMs, dt);
+    float leftTargetMMs  = targetSpeedMMs - turnRateMMs;
+    float rightTargetMMs = targetSpeedMMs + turnRateMMs;
+
+    int leftPWM  = computePID(leftPID,  leftTargetMMs,  leftSpeedMMs, dt);
+    int rightPWM = computePID(rightPID, rightTargetMMs, rightSpeedMMs, dt);
 
     leftPWM  = applySlipCorrection(leftPWM,  leftFrontMMs,  leftRearMMs);
     rightPWM = applySlipCorrection(rightPWM, rightFrontMMs, rightRearMMs);
@@ -324,6 +361,9 @@ void loop() {
     saberRight.writeMicroseconds(rightPWM);
 
     String line = "tgt:" + String(targetSpeedMMs) +
+                  " turn:" + String(turnRateMMs) +
+                  " leftTgt:" + String(leftTargetMMs) +
+                  " rightTgt:" + String(rightTargetMMs) +
                   " LF:" + String(leftFrontMMs) +
                   " LR:" + String(leftRearMMs) +
                   " RF:" + String(rightFrontMMs) +
@@ -339,6 +379,53 @@ void loop() {
 }
 
 // ---------------- HELPERS ----------------
+
+// Maps the "Bluetooth RC Controller" app's default single-character
+// protocol (streamed continuously while a direction is held) onto
+// targetSpeedMMs/turnRateMMs. Returns true and consumes the character
+// if it matched an RC command, false (without consuming anything) if
+// it didn't - so the caller can fall back to numeric parsing.
+bool handleRcChar(int c) {
+  switch (c) {
+    case 'F': case 'f':
+      targetSpeedMMs = constrain(targetSpeedMMs + RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = 0;
+      break;
+    case 'B': case 'b':
+      targetSpeedMMs = constrain(targetSpeedMMs - RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = 0;
+      break;
+    case 'L': case 'l':
+      targetSpeedMMs = 0; turnRateMMs = -RC_TURN_MMS;
+      break;
+    case 'R': case 'r':
+      targetSpeedMMs = 0; turnRateMMs = RC_TURN_MMS;
+      break;
+    case 'G': case 'g': // forward-left
+      targetSpeedMMs = constrain(targetSpeedMMs + RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = -RC_TURN_MMS;
+      break;
+    case 'I': case 'i': // forward-right
+      targetSpeedMMs = constrain(targetSpeedMMs + RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = RC_TURN_MMS;
+      break;
+    case 'H': case 'h': // backward-left
+      targetSpeedMMs = constrain(targetSpeedMMs - RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = -RC_TURN_MMS;
+      break;
+    case 'J': case 'j': // backward-right
+      targetSpeedMMs = constrain(targetSpeedMMs - RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
+      turnRateMMs = RC_TURN_MMS;
+      break;
+    case 'S': case 's':
+      targetSpeedMMs = 0; turnRateMMs = 0; // deliberate release - stop promptly, don't coast
+      break;
+    default:
+      return false;
+  }
+  Serial.read(); // consume the command character
+  return true;
+}
 
 float ticksToMMs(long ticks, float dt) {
   if (dt <= 0) return 0;
