@@ -49,17 +49,37 @@
        nonzero, so the robot still coasts to a genuine stop at
        target=0 instead of jittering.
 
-  HC-05 Bluetooth (wireless tuning from Android):
+  HC-05 Bluetooth (wireless monitoring/tuning from a paired PC or phone):
   HC-05 VCC -> Uno 5V
   HC-05 GND -> Uno GND
-  HC-05 TX  -> Uno pin 8   (direct - 3.3V out is fine into Uno RX)
-  HC-05 RX  -> Uno pin 13  (THROUGH a 1k/2k voltage divider - Uno's 5V
-                            TX would over-drive the HC-05's 3.3V RX pin)
-  Uses SoftwareSerial on pins 8/13 so the hardware Serial port (0/1)
-  stays free for USB - upload and USB debugging are unaffected, and
-  tuning commands/telemetry work over either USB or Bluetooth.
+  HC-05 TX  -> Uno pin 0 (RX) (direct - 3.3V out is fine into Uno RX)
+  HC-05 RX  -> Uno pin 1 (TX) (THROUGH a 1k/2k voltage divider - Uno's 5V
+                                TX would over-drive the HC-05's 3.3V RX pin)
+  Wired directly to the hardware Serial pins (0/1), NOT SoftwareSerial.
+  SoftwareSerial was tried first, but it unconditionally claims all
+  three AVR pin-change-interrupt vectors as soon as any SoftwareSerial
+  object is used, regardless of which pins you pick - that's a hard
+  conflict with the rear encoders' hand-written ISR(PCINT0_vect) (link
+  error: "multiple definition of __vector_3"). AltSoftSerial avoids
+  that but needs Timer1, which the Servo library already owns
+  exclusively for both Sabertooth channels. Hardware Serial sidesteps
+  both problems entirely.
+
+  TRADEOFF: pins 0/1 are shared with the USB-to-serial chip, so USB
+  Serial Monitor and a live Bluetooth connection can't both be active
+  at once, and the HC-05's RX line should be disconnected (or switched
+  out) while uploading new code via USB, since stray Bluetooth traffic
+  can interfere with the bootloader.
+
+  Once paired, Windows exposes the HC-05 as a virtual COM port - point
+  PlatformIO's Serial Monitor at that port instead of the USB one to
+  watch telemetry and send target-speed commands wirelessly. Uploading
+  new code over that same virtual port is possible in principle but
+  unreliable (no DTR auto-reset over Bluetooth SPP, and the HC-05's
+  default 9600 baud doesn't match the bootloader's expected upload
+  rate) - keep using USB for uploads.
   Default HC-05 baud is 9600 unless you've reconfigured it via AT
-  commands - matches BT_BAUD below.
+  commands - matches Serial.begin() below.
 
   WHY THIS SETUP
   --------------
@@ -86,11 +106,6 @@
 
 #include <Arduino.h>
 #include <Servo.h>
-#include <SoftwareSerial.h>
-
-// Set to 1 once the HC-05 module is wired up and ready to use.
-// While 0, all Bluetooth code is skipped - tuning/telemetry only over USB.
-#define ENABLE_BLUETOOTH 0
 
 // ---------------- USER CONFIG ----------------
 
@@ -176,20 +191,10 @@ const int RF_A = 3,  RF_B = 5;   // right front (hardware interrupt)
 const int LR_A = 11, LR_B = 6;   // left rear   (pin-change interrupt)
 const int RR_A = 12, RR_B = 7;   // right rear  (pin-change interrupt)
 
-// HC-05 Bluetooth module (wireless tuning), on SoftwareSerial so USB
-// Serial (pins 0/1) stays free for uploads and USB debugging.
-const int BT_RX_PIN = 8;   // to HC-05 TX
-const int BT_TX_PIN = 13;  // to HC-05 RX (via voltage divider)
-const long BT_BAUD = 9600; // HC-05 default; update if you've reconfigured it
-
 // ---------------- INTERNAL STATE ----------------
 
 Servo saberLeft;
 Servo saberRight;
-
-#if ENABLE_BLUETOOTH
-SoftwareSerial bluetooth(BT_RX_PIN, BT_TX_PIN);
-#endif
 
 volatile long lfTicks = 0, rfTicks = 0, lrTicks = 0, rrTicks = 0; // signed
 
@@ -229,15 +234,11 @@ float ticksToMMs(long ticks, float dt);
 int computePID(PID &state, float target, float measured, float dt);
 int applySlipCorrection(int pwm, float frontMMs, float rearMMs);
 int slewLimit(int rawPWM, int &lastApplied);
-void printBoth(const String &line);
 
 // ---------------- SETUP ----------------
 
 void setup() {
-  Serial.begin(9600);
-#if ENABLE_BLUETOOTH
-  bluetooth.begin(BT_BAUD);
-#endif
+  Serial.begin(9600); // shared USB + HC-05 (see WIRING notes above)
 
   pinMode(LF_A, INPUT_PULLUP); pinMode(LF_B, INPUT_PULLUP);
   pinMode(RF_A, INPUT_PULLUP); pinMode(RF_B, INPUT_PULLUP);
@@ -258,7 +259,7 @@ void setup() {
   saberRight.writeMicroseconds(PWM_STOP);
   delay(500);
 
-  printBoth("Ready. Send a number to set target speed in mm/s (negative = reverse).");
+  Serial.println("Ready. Send a number to set target speed in mm/s (negative = reverse).");
   lastControlTime = millis();
 }
 
@@ -267,14 +268,8 @@ void setup() {
 void loop() {
   if (Serial.available()) {
     targetSpeedMMs = Serial.parseFloat();
-    printBoth("New target speed (mm/s): " + String(targetSpeedMMs));
+    Serial.println("New target speed (mm/s): " + String(targetSpeedMMs));
   }
-#if ENABLE_BLUETOOTH
-  if (bluetooth.available()) {
-    targetSpeedMMs = bluetooth.parseFloat();
-    printBoth("New target speed (mm/s): " + String(targetSpeedMMs));
-  }
-#endif
 
   unsigned long now = millis();
   if (now - lastControlTime >= CONTROL_PERIOD_MS) {
@@ -298,7 +293,7 @@ void loop() {
     //               " leftRearMMs:" + String(leftRearMMs) +
     //               " rightFrontMMs:" + String(rightFrontMMs) +
     //               " rightRearMMs:" + String(rightRearMMs);
-    // printBoth(line);
+    // Serial.println(line);
 
     // Use the average of front+rear per side as the PID feedback signal
     float leftSpeedMMs  = (leftFrontMMs + leftRearMMs) / 2.0;
@@ -331,18 +326,11 @@ void loop() {
                   " Rpwm:" + String(rightPWM);
     if (leftSlip)  line += " [LEFT SLIP]";
     if (rightSlip) line += " [RIGHT SLIP]";
-    printBoth(line);
+    Serial.println(line);
   }
 }
 
 // ---------------- HELPERS ----------------
-
-void printBoth(const String &line) {
-  Serial.println(line);
-#if ENABLE_BLUETOOTH
-  bluetooth.println(line);
-#endif
-}
 
 float ticksToMMs(long ticks, float dt) {
   if (dt <= 0) return 0;
