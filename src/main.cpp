@@ -268,6 +268,14 @@ void setup() {
 void loop() {
   if (Serial.available()) {
     targetSpeedMMs = Serial.parseFloat();
+    // Drain any trailing CR/LF left behind by the sender (some terminal
+    // apps send \r\n rather than a single terminator) - otherwise the
+    // leftover byte trips Serial.available() again next loop, and a
+    // second parseFloat() call with nothing but whitespace to read
+    // times out and silently overwrites targetSpeedMMs back to 0.
+    while (Serial.available() && (Serial.peek() == '\n' || Serial.peek() == '\r')) {
+      Serial.read();
+    }
     Serial.println("New target speed (mm/s): " + String(targetSpeedMMs));
   }
 
