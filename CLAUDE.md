@@ -16,7 +16,7 @@ A small 4WD robot built to uproot weeds from a gravel driveway. Built on an A4WD
 - **Microcontroller:** Arduino Uno
 - **Communication:** HC-05 Bluetooth module (wireless telemetry/tuning and RC control)
 - **Sensing:** HC-SR04 ultrasonic sensor (front bumper/obstacle detection; currently informational only, not acted on)
-- **End effector:** not yet specified — mechanism for uprooting weeds, e.g. tines/spikes/tiller — TBD
+- **End effector (in progress):** trailing tine rake, towed behind the chassis on a parallel-arm rigid-rod linkage (pivots at both the chassis and the strip, so rake angle stays constant as it rides over gravel). Tines are individually-sprung coil tines (~1.2mm wire, e.g. Bosch/Atco/Qualcast scarifier-cassette replacement tines, F016T47920-compatible) mounted along a rod spanning the chassis track width, spaced ~25–30mm apart. Not yet built/validated — currently at the test-strip prototype stage.
 
 ## Commands
 
