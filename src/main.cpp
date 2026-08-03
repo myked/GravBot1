@@ -195,7 +195,7 @@ const float SLIP_THRESHOLD_MMS = 15.0;
 // slipResponseEnabled = true and bring slipCorrectionGain up from a small
 // value (e.g. 2.0) - it scales "mm/s of slip beyond threshold" into
 // "microseconds pulled back toward stop".
-bool  slipResponseEnabled = false;
+bool  slipResponseEnabled = false;x
 float slipCorrectionGain  = 0.0;
 
 // How often the control loop runs
