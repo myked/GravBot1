@@ -93,10 +93,3 @@ Sampled independently of the 20Hz motor control loop (see `SENSOR_PERIOD_MS`) �
 - **`src/stages/*.cpp`** are standalone, incrementally more complex sketches (encoders-only → open-loop drive → single-side PID → full dual PID) used for isolated hardware bring-up/debugging; each has its own `platformio.ini` environment and is not compiled into the main build (`build_src_filter` excludes `stages/` in `env:uno`). Consult them for the historical debugging process behind constants tuned in `main.cpp`.
 
 ## Gotchas / stability fixes
-
-(from staged bring-up in `src/stages/` — see those files for the full investigation)
-
-1. **DIP switches must be firmly seated in Independent mode.** A half-seated switch silently runs Mixed mode instead, where one Sabertooth input becomes "throttle" and the other becomes "turn" — both wheels then react to both PID loops at once, which reads exactly like uncontrollable oscillation.
-2. **Right-side encoders read NEGATIVE for forward rotation** (mirror-mounted relative to left) — see `RIGHT_SIGN`. Without this, the right PID loop sees inverted feedback and fights itself.
-3. **PID output is slew-rate limited** (`MAX_PWM_STEP_PER_CYCLE`) — without it, a single noisy reading can slam the motor from full-forward to full-reverse in one 50ms step, and that abrupt reversal induces real electrical/mechanical noise that corrupts the next reading too — a self-sustaining feedback loop, which was the root cause of the original wild instability.
-4. **Below ~100us PWM offset this drivetrain sits in a stochastic dead zone** (see `MIN_RELIABLE_PWM_OFFSET`) — the deadband compensation in `computePID()` snaps any nonzero-target output up to that floor rather than letting it hover in the unreliable zone. It's guarded to only apply when the target is actually nonzero, so the robot still coasts to a genuine stop at target=0 instead of jittering.
