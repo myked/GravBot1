@@ -81,6 +81,25 @@
   Default HC-05 baud is 9600 unless you've reconfigured it via AT
   commands - matches Serial.begin() below.
 
+  HC-SR04 ultrasonic (front bumper/obstacle sensor):
+  HC-SR04 VCC  -> Uno 5V
+  HC-SR04 GND  -> Uno GND
+  HC-SR04 TRIG -> Uno pin 8  (output, 10us trigger pulse)
+  HC-SR04 ECHO -> Uno pin A0 (input, pulseIn() measures echo width)
+
+  POWER: the Sabertooth 2x12's onboard 5V BEC feeds the Uno and
+  everything else on the 5V rail (HC-05, HC-SR04) - no separate
+  regulator needed. Confirm the BEC jumper is set to supply 5V; if it's
+  ever removed/disabled, powering the Uno via USB alone would leave the
+  HC-05 and HC-SR04 without 5V.
+
+  Sampled independently of the 20Hz motor control loop (see
+  SENSOR_PERIOD_MS below) - pulseIn() blocks for up to ECHO_TIMEOUT_US,
+  and running it inside the 50ms control cycle every time would eat a
+  meaningful chunk of that budget. Currently informational only:
+  frontDistanceMM is read and logged in telemetry, but nothing in the
+  control loop reacts to it yet - it does not brake or stop the robot.
+
   WHY THIS SETUP
   --------------
   Left-side motors (front+rear) are paralleled onto Sabertooth M1,
@@ -142,17 +161,32 @@ float turnRateMMs = 0.0;
 // forced to 0, turnRateMMs set directly), a separate action from
 // throttle. None of these three have been bench tuned yet - if the ramp
 // feels too fast/slow or turns too sharp/soft, adjust them.
-const float RC_SPEED_MMS      = 2000.0; // ceiling for the held-throttle ramp
+const float RC_SPEED_MMS      = 3000.0; // ceiling for the held-throttle ramp
 const float RC_SPEED_STEP_MMS = 40.0;   // added/subtracted per repeat while held
-const float RC_TURN_MMS       = 200.0; // fixed turn bias, applied instantly
+// Lowered from 1000 - at 1000 a static turn pushes one side's target to
+// 1500mm/s (500 base +/- 1000 turn), deep enough into the nonlinear zone
+// above MIN_RELIABLE_PWM_OFFSET that computePID's raw output saturates
+// almost every cycle. With the error that large Kp stops mattering and
+// the slew limiter alone drives the output, walking +/-MAX_PWM_STEP_PER_CYCLE
+// every single cycle with no convergence - that's the bench-observed
+// jerkiness (Lpwm ping-ponging 1580/1600, Rpwm sawtoothing 1400-1600).
+// 650 keeps pivot targets in a less saturated range.
+const float RC_TURN_MMS       = 650.0;  // fixed turn bias, applied instantly
 
 // PID gains - the original 0.9/0.4/0.02 here were an untested guess and
-// caused the instability documented above. Reset to the Kp-only, low
-// starting point validated in src/stages/stage3_single_side_pid.cpp and
-// stage4_full_dual_pid.cpp; raise Kp first, then add small Ki/Kd per the
-// TUNING note below, watching for the slew-limited Lpwm/Rpwm staying
-// bounded rather than banging between PWM_MIN/PWM_MAX.
-float Kp = 0.3;
+// caused the instability documented above. 0.3 was the next validated
+// starting point (src/stages/stage3_single_side_pid.cpp,
+// stage4_full_dual_pid.cpp), but bench testing of the static turn showed
+// even 0.3 is too high: MAX_PWM_STEP_PER_CYCLE rate-limits the actuator,
+// and at Kp=0.3 the computed output almost always demands a bigger PWM
+// swing per cycle than the slew limit can deliver - a rate-limited
+// actuator plus too much loop gain is a textbook recipe for a sustained
+// limit cycle (Lpwm/Rpwm banging between extremes, wheels visibly
+// reversing). Dropped to 0.08 as a lower starting point; use the live
+// P<value> serial command to bench-tune upward from here without
+// reflashing, watching for Lpwm/Rpwm settling near a value instead of
+// oscillating.
+float Kp = 0.08;
 float Ki = 0.0;
 float Kd = 0.0;
 
@@ -177,6 +211,19 @@ const int STICTION_KICK = 40;
 // cycle held continuously.
 const int MIN_RELIABLE_PWM_OFFSET = 100;
 
+// Below this measured speed, the wheel is considered still "stalled" and
+// the MIN_RELIABLE_PWM_OFFSET floor below applies (breaking static
+// friction from a near-stop needs the guaranteed-spin kick). Above it,
+// the wheel is already moving and small PID corrections are let through
+// unmodified - kinetic friction is lower than static, so holding/nudging
+// an already-spinning wheel doesn't need the same floor. Without this
+// guard the floor was firing on EVERY cycle where target != 0 (most of
+// them, since a small tracking error produces a small Kp*error output),
+// turning ordinary fine corrections into full +/-100us commands and
+// producing a relay-like oscillation that never settled regardless of Kp
+// - see bench notes on Kp above.
+const float DEADBAND_RECOVERY_SPEED_MMS = 50.0;
+
 // Max change in written PWM per control cycle (us). Caps how fast the
 // output can swing regardless of what the PID computes - see
 // STABILITY FIXES #3 above.
@@ -184,6 +231,12 @@ const int MAX_PWM_STEP_PER_CYCLE = 20;
 
 // If front/rear speed on a side differ by more than this, flag slip
 const float SLIP_THRESHOLD_MMS = 15.0;
+
+// --- Front ultrasonic sensor (HC-SR04) ---
+// Informational only for now - see loop() and measureFrontDistanceMM().
+const unsigned long SENSOR_PERIOD_MS = 100;   // 10Hz, independent of the 20Hz control loop
+const unsigned long ECHO_TIMEOUT_US  = 25000; // bounds pulseIn()'s worst-case block (~4.3m range)
+const float OBSTACLE_WARN_MM         = 300.0; // flagged in telemetry below this range, not acted on
 
 // --- Slip response (traction control) ---
 // This backs off torque on a side once it's slipping past SLIP_THRESHOLD_MMS.
@@ -211,6 +264,9 @@ const int LF_A = 2,  LF_B = 4;   // left front  (hardware interrupt)
 const int RF_A = 3,  RF_B = 5;   // right front (hardware interrupt)
 const int LR_A = 11, LR_B = 6;   // left rear   (pin-change interrupt)
 const int RR_A = 12, RR_B = 7;   // right rear  (pin-change interrupt)
+
+const int BUMPER_TRIG = 8;   // HC-SR04 trigger (output)
+const int BUMPER_ECHO = A0;  // HC-SR04 echo (input)
 
 // ---------------- INTERNAL STATE ----------------
 
@@ -247,11 +303,15 @@ unsigned long lastControlTime = 0;
 int lastAppliedLeftPWM = PWM_STOP;
 int lastAppliedRightPWM = PWM_STOP;
 
+unsigned long lastSensorTime = 0;
+float frontDistanceMM = -1; // last HC-SR04 reading; -1 = no echo / out of range
+
 // ---------------- FUNCTION PROTOTYPES ----------------
 // Declared here so they're known before use in loop(), rather than
 // relying on the Arduino build step to auto-generate prototypes.
 
 float ticksToMMs(long ticks, float dt);
+float measureFrontDistanceMM();
 int computePID(PID &state, float target, float measured, float dt);
 int applySlipCorrection(int pwm, float frontMMs, float rearMMs);
 int slewLimit(int rawPWM, int &lastApplied);
@@ -266,6 +326,10 @@ void setup() {
   pinMode(RF_A, INPUT_PULLUP); pinMode(RF_B, INPUT_PULLUP);
   pinMode(LR_A, INPUT_PULLUP); pinMode(LR_B, INPUT_PULLUP);
   pinMode(RR_A, INPUT_PULLUP); pinMode(RR_B, INPUT_PULLUP);
+
+  pinMode(BUMPER_TRIG, OUTPUT);
+  pinMode(BUMPER_ECHO, INPUT);
+  digitalWrite(BUMPER_TRIG, LOW);
 
   attachInterrupt(digitalPinToInterrupt(LF_A), lfISR, RISING);
   attachInterrupt(digitalPinToInterrupt(RF_A), rfISR, RISING);
@@ -284,6 +348,9 @@ void setup() {
   Serial.println("Ready. Send speed in mm/s, optionally followed by a turn rate,");
   Serial.println("e.g. \"500\" for straight or \"500 100\" to bias right (negative = reverse/left).");
   Serial.println("Or drive with the Bluetooth RC Controller app (F/B/L/R/G/H/I/J/S).");
+  Serial.println("P<value>=set Kp live, e.g. P0.3   K<value>=set Ki live, e.g. K0.1");
+  Serial.println("Kp=" + String(Kp) + " Ki=" + String(Ki) + " Kd=" + String(Kd));
+  Serial.println("Front ultrasonic (HC-SR04) logged in telemetry as front:<mm>, -1 = no echo.");
   lastControlTime = millis();
 }
 
@@ -291,7 +358,21 @@ void setup() {
 
 void loop() {
   if (Serial.available()) {
-    if (!handleRcChar(Serial.peek())) {
+    int c = Serial.peek();
+    // 'P'/'K' for live Kp/Ki tuning - not 'I' for Ki, since 'I' is already
+    // the RC app's forward-right command. Neither letter collides with any
+    // RC char (F/B/L/R/G/H/I/J/S/U/D), so this can't misfire from the app.
+    bool isGainCmd = (c == 'P' || c == 'p' || c == 'K' || c == 'k');
+
+    if (c == 'P' || c == 'p') {
+      Serial.read();
+      Kp = Serial.parseFloat();
+      Serial.println("Kp = " + String(Kp));
+    } else if (c == 'K' || c == 'k') {
+      Serial.read();
+      Ki = Serial.parseFloat();
+      Serial.println("Ki = " + String(Ki));
+    } else if (!handleRcChar(c)) {
       // Not an RC app character - fall back to the typed "speed [turn]"
       // format used by a plain terminal app.
       targetSpeedMMs = Serial.parseFloat();
@@ -315,11 +396,21 @@ void loop() {
     while (Serial.available() && (Serial.peek() == '\n' || Serial.peek() == '\r')) {
       Serial.read();
     }
-    Serial.println("New target speed (mm/s): " + String(targetSpeedMMs) +
-                    "  turn rate (mm/s): " + String(turnRateMMs));
+    if (!isGainCmd) {
+      Serial.println("New target speed (mm/s): " + String(targetSpeedMMs) +
+                      "  turn rate (mm/s): " + String(turnRateMMs));
+    }
   }
 
   unsigned long now = millis();
+
+  // Sampled on its own cadence, independent of the 20Hz control loop
+  // below - see the HC-SR04 note in the header comment.
+  if (now - lastSensorTime >= SENSOR_PERIOD_MS) {
+    lastSensorTime = now;
+    frontDistanceMM = measureFrontDistanceMM();
+  }
+
   if (now - lastControlTime >= CONTROL_PERIOD_MS) {
     float dt = (now - lastControlTime) / 1000.0;
     lastControlTime = now;
@@ -337,7 +428,14 @@ void loop() {
     float rightFrontMMs = ticksToMMs(rf, dt);
     float rightRearMMs  = ticksToMMs(rr, dt);
 
-    // Use the average of front+rear per side as the PID feedback signal
+    // Use the average of front+rear per side as the PID feedback signal.
+    // (Tried EMA-filtering this to fight the oscillation below - made it
+    // worse: this loop's actuator is rate-limited (MAX_PWM_STEP_PER_CYCLE)
+    // and Kp was demanding bigger swings than the slew limit could deliver
+    // in one cycle, which is a rate-limit-induced limit cycle, not sensor
+    // noise. Adding filter lag to an already-oscillating rate-limited loop
+    // just widens the oscillation instead of damping it - see Kp note
+    // below for the actual fix.)
     float leftSpeedMMs  = (leftFrontMMs + leftRearMMs) / 2.0;
     float rightSpeedMMs = (rightFrontMMs + rightRearMMs) / 2.0;
 
@@ -371,9 +469,11 @@ void loop() {
                   " leftSpeedMMs:" + String(leftSpeedMMs) +
                   " rightSpeedMMs:" + String(rightSpeedMMs) +
                   " Lpwm:" + String(leftPWM) +
-                  " Rpwm:" + String(rightPWM);
+                  " Rpwm:" + String(rightPWM) +
+                  " front:" + String(frontDistanceMM);
     if (leftSlip)  line += " [LEFT SLIP]";
     if (rightSlip) line += " [RIGHT SLIP]";
+    if (frontDistanceMM > 0 && frontDistanceMM < OBSTACLE_WARN_MM) line += " [OBSTACLE]";
     Serial.println(line);
   }
 }
@@ -396,10 +496,13 @@ bool handleRcChar(int c) {
       turnRateMMs = 0;
       break;
     case 'L': case 'l':
-      targetSpeedMMs = 0; turnRateMMs = -RC_TURN_MMS;
+      // Curve, don't stop-and-pivot - leave whatever speed is already
+      // set alone, only bias the turn. Pressing F/B resets turnRateMMs
+      // back to 0, which doubles as a "go straight" action.
+      turnRateMMs = -RC_TURN_MMS;
       break;
     case 'R': case 'r':
-      targetSpeedMMs = 0; turnRateMMs = RC_TURN_MMS;
+      turnRateMMs = RC_TURN_MMS;
       break;
     case 'G': case 'g': // forward-left
       targetSpeedMMs = constrain(targetSpeedMMs + RC_SPEED_STEP_MMS, -RC_SPEED_MMS, RC_SPEED_MMS);
@@ -420,6 +523,12 @@ bool handleRcChar(int c) {
     case 'S': case 's':
       targetSpeedMMs = 0; turnRateMMs = 0; // deliberate release - stop promptly, don't coast
       break;
+    case 'U': case 'u': // full speed forward - jumps straight to the ceiling, no ramp needed
+      targetSpeedMMs = RC_SPEED_MMS; turnRateMMs = 0;
+      break;
+    case 'D': case 'd': // full speed backward
+      targetSpeedMMs = -RC_SPEED_MMS; turnRateMMs = 0;
+      break;
     default:
       return false;
   }
@@ -431,6 +540,23 @@ float ticksToMMs(long ticks, float dt) {
   if (dt <= 0) return 0;
   float revs = ticks / ENCODER_CPR;
   return (revs * WHEEL_CIRCUMF_MM) / dt;
+}
+
+// Reads the HC-SR04: 10us trigger pulse out, then times the echo's HIGH
+// duration and converts to millimeters using the speed of sound
+// (~343 m/s => 0.1715mm per microsecond of round-trip time). Returns -1
+// if no echo comes back within ECHO_TIMEOUT_US (out of range, or nothing
+// reflecting back to the sensor).
+float measureFrontDistanceMM() {
+  digitalWrite(BUMPER_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(BUMPER_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(BUMPER_TRIG, LOW);
+
+  unsigned long duration = pulseIn(BUMPER_ECHO, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return -1;
+  return duration * 0.1715;
 }
 
 // Pulls PWM back toward PWM_STOP proportionally to slip severity.
@@ -467,11 +593,15 @@ int computePID(PID &state, float target, float measured, float dt) {
   }
 
   // Deadband compensation - only when we actually want motion (nonzero
-  // target), otherwise a tiny residual-noise correction while trying to
-  // sit at target=0 would get blown up into a full-strength drive
-  // command. See STABILITY FIXES #4 above.
+  // target) AND the wheel is still near-stalled (see
+  // DEADBAND_RECOVERY_SPEED_MMS above). Otherwise a tiny residual-noise
+  // correction while trying to sit at target=0 would get blown up into a
+  // full-strength drive command, and - the bug this guard fixes - an
+  // ordinary small correction while already moving would too. See
+  // STABILITY FIXES #4 above.
   int offset = pwm - PWM_STOP;
-  if (fabs(target) > 0.1 && offset != 0 && abs(offset) < MIN_RELIABLE_PWM_OFFSET) {
+  if (fabs(target) > 0.1 && fabs(measured) < DEADBAND_RECOVERY_SPEED_MMS &&
+      offset != 0 && abs(offset) < MIN_RELIABLE_PWM_OFFSET) {
     pwm = PWM_STOP + (offset > 0 ? MIN_RELIABLE_PWM_OFFSET : -MIN_RELIABLE_PWM_OFFSET);
   }
 
@@ -481,7 +611,54 @@ int computePID(PID &state, float target, float measured, float dt) {
 // Caps how much the written PWM can change in one control cycle,
 // regardless of what computePID/applySlipCorrection want - see
 // STABILITY FIXES #3 above.
+//
+// Exception: if we were genuinely AT REST (lastApplied exactly at
+// PWM_STOP, not just "somewhere near the dead zone") and the target has
+// already jumped past the dead zone (via computePID()'s deadband
+// compensation), jump straight to the FULL computed target on this one
+// cycle instead of creeping through it a MAX_PWM_STEP_PER_CYCLE at a
+// time - slewing gradually through 0-100us offset just spends several
+// cycles producing the unpredictable twitching that zone is known for
+// (see MIN_RELIABLE_PWM_OFFSET) before reaching reliable torque. Using
+// the full target rather than capping at the dead zone's bare-minimum
+// edge matters in practice: a pivot turn on the ground needs more
+// torque to break real static/scrub friction than bench testing (which
+// calibrated MIN_RELIABLE_PWM_OFFSET) accounted for, and computePID()
+// already reflects that in its raw output once the commanded turn/speed
+// is large enough - landing only at the 100us floor and then crawling
+// the rest of the way at 20us/cycle was both sticky (undershoots what's
+// needed to break loose) and slow (many cycles to get there). Safe to
+// jump straight to rawPWM because computePID() already clamps it to
+// PWM_MIN/PWM_MAX, and because of the constraint below, this can still
+// only ever fire once per stop, not repeatedly.
+//
+// IMPORTANT: this must require exact equality to PWM_STOP, not "close
+// to it" - an earlier version used abs(lastOffset) < MIN_RELIABLE_PWM_OFFSET,
+// which could also fire while lastApplied was mid-transition near the
+// zone's edge with a noisy/still-decelerating raw target on the
+// OPPOSITE side, causing repeated ~180us instant jumps back and forth
+// across the zone every cycle - a self-sustaining oscillation that
+// bypassed the slew limit entirely and didn't stop even at target=0
+// (computePID doesn't deadband-compensate a zero target, so residual
+// momentum/noise could still swing the raw PID output wildly). Exact
+// equality means this can only fire once, on the very first cycle
+// moving away from a true stop.
 int slewLimit(int rawPWM, int &lastApplied) {
+  int targetOffset = rawPWM - PWM_STOP;
+  if (lastApplied == PWM_STOP && abs(targetOffset) >= MIN_RELIABLE_PWM_OFFSET) {
+    // REVERTED from jumping straight to the full rawPWM target - that
+    // made on-ground pivot turns worse, not better, likely because a
+    // bigger single-cycle torque kick exceeded the wheel's maximum
+    // static grip and caused it to skid/spin in place instead of
+    // actually turning the chassis (kinetic friction while slipping is
+    // generally lower than static, so "more torque" doesn't reliably
+    // mean "turns faster" once you're past that limit) - or induced the
+    // same kind of noise the slew limiter exists to prevent. Back to
+    // capping the one-time jump at the dead zone's edge.
+    lastApplied = PWM_STOP + (targetOffset > 0 ? MIN_RELIABLE_PWM_OFFSET : -MIN_RELIABLE_PWM_OFFSET);
+    return constrain(lastApplied, PWM_MIN, PWM_MAX);
+  }
+
   int applied = constrain(rawPWM, lastApplied - MAX_PWM_STEP_PER_CYCLE,
                                     lastApplied + MAX_PWM_STEP_PER_CYCLE);
   applied = constrain(applied, PWM_MIN, PWM_MAX);

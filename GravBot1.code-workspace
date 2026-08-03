@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "GravBot1",
+			"path": "."
+		},
+		{
+			"name": "GravBot2",
+			"path": "../GravBot2"
+		}
+	],
+	"settings": {}
+}
