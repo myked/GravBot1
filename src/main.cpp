@@ -248,7 +248,7 @@ const float OBSTACLE_WARN_MM         = 300.0; // flagged in telemetry below this
 // slipResponseEnabled = true and bring slipCorrectionGain up from a small
 // value (e.g. 2.0) - it scales "mm/s of slip beyond threshold" into
 // "microseconds pulled back toward stop".
-bool  slipResponseEnabled = false;x
+bool  slipResponseEnabled = false;
 float slipCorrectionGain  = 0.0;
 
 // How often the control loop runs
