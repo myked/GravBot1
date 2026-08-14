@@ -15,6 +15,12 @@
   Left  REAR  B -> pin 6   (plain digital input)
   Right REAR  A -> pin 12  (PCINT, pin-change interrupt group)
   Right REAR  B -> pin 7   (plain digital input)
+
+  NOTE: "FRONT"/"REAR" here label physical axle position on the
+  chassis and are unrelated to which end is the robot's operational
+  front (i.e. the HC-SR04 end) - they haven't moved and don't need to
+  change if the HC-SR04 gets remounted again. See FORWARD_SIGN below
+  for how the operational front/back (and left/right) is handled.
   Sabertooth S2 (left side)  -> pin 10 (PWM out from Arduino)
   Sabertooth S1 (right side) -> pin 9  (PWM out from Arduino)
   Arduino GND -> Sabertooth 0V
@@ -86,6 +92,12 @@
   HC-SR04 GND  -> Uno GND
   HC-SR04 TRIG -> Uno pin 8  (output, 10us trigger pulse)
   HC-SR04 ECHO -> Uno pin A0 (input, pulseIn() measures echo width)
+
+  Physically mounted on whichever end of the chassis is currently the
+  robot's front (pins unchanged if it's moved - only the wiring routes
+  to a different end). "Forward" driving is defined as toward this
+  sensor - see FORWARD_SIGN below, which is what actually enforces
+  that regardless of which end the sensor is bolted to.
 
   POWER: the Sabertooth 2x12's onboard 5V BEC feeds the Uno and
   everything else on the 5V rail (HC-05, HC-SR04) - no separate
@@ -267,6 +279,27 @@ const unsigned long CONTROL_PERIOD_MS = 50; // 20 Hz
 // Right side reads negative for forward rotation (mirror-mounted
 // relative to left) - see STABILITY FIXES #2 above.
 const int RIGHT_SIGN = -1;
+
+// The HC-SR04 was remounted to the opposite end of the chassis, so
+// what the operator calls "forward" (F / positive typed speed / RC
+// U) now needs to drive the robot toward that end. Everything below
+// this point (encoder sign convention, PID, slew limiting, PWM
+// direction) is unchanged and stays internally self-consistent in
+// the ORIGINAL "direction A" convention it was tuned against -
+// touching any of that risks reintroducing the oscillation documented
+// in STABILITY FIXES above. Instead this one constant is applied where
+// the user-facing targetSpeedMMs/turnRateMMs (unchanged meaning: still
+// set by handleRcChar()/typed input exactly as before) get converted
+// into the PID's leftTargetMMs/rightTargetMMs. Redefining which end is
+// "front" is a 180-degree reinterpretation of the whole reference
+// frame, not just forward/back - applying the same sign to both the
+// speed and turn terms is what correctly also swaps which physical
+// side responds to "left"/"right" (turn yourself 180 degrees and your
+// left hand points the other way too). Do NOT "fix" this instead by
+// flipping individual RC cases (F/B/L/R/G/H/I/J/U/D) - it would have to
+// be done consistently across all of them to get the same result, and
+// is much easier to get wrong.
+const int FORWARD_SIGN = -1;
 
 // ---------------- PIN CONFIG ----------------
 
@@ -454,8 +487,10 @@ void loop() {
     bool leftSlip  = fabs(leftFrontMMs - leftRearMMs) > SLIP_THRESHOLD_MMS;
     bool rightSlip = fabs(rightFrontMMs - rightRearMMs) > SLIP_THRESHOLD_MMS;
 
-    float leftTargetMMs  = targetSpeedMMs - turnRateMMs;
-    float rightTargetMMs = targetSpeedMMs + turnRateMMs;
+    // FORWARD_SIGN converts the user-facing command into the PID's
+    // unchanged internal direction convention - see its declaration above.
+    float leftTargetMMs  = FORWARD_SIGN * (targetSpeedMMs - turnRateMMs);
+    float rightTargetMMs = FORWARD_SIGN * (targetSpeedMMs + turnRateMMs);
 
     int leftPWM  = computePID(leftPID,  leftTargetMMs,  leftSpeedMMs, dt);
     int rightPWM = computePID(rightPID, rightTargetMMs, rightSpeedMMs, dt);
@@ -471,7 +506,11 @@ void loop() {
     // than slewing down to it, and reset lastApplied so the slew limiter
     // starts clean from a true stop next cycle (see slewLimit()'s exact-
     // equality note on why that matters). Reversing/turning in place is
-    // left alone since targetSpeedMMs is not > 0 in that case.
+    // left alone since targetSpeedMMs is not > 0 in that case. Still
+    // correctly means "user-commanded forward" (i.e. toward the sensor)
+    // after the HC-SR04 remount - targetSpeedMMs itself is untouched by
+    // FORWARD_SIGN, only its conversion into leftTargetMMs/rightTargetMMs
+    // is (see FORWARD_SIGN above) - so this condition needs no change.
     bool obstacleStop = (frontDistanceMM > 0 && frontDistanceMM < OBSTACLE_STOP_MM &&
                           targetSpeedMMs > 0);
     if (obstacleStop) {
