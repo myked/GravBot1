@@ -96,9 +96,14 @@
   Sampled independently of the 20Hz motor control loop (see
   SENSOR_PERIOD_MS below) - pulseIn() blocks for up to ECHO_TIMEOUT_US,
   and running it inside the 50ms control cycle every time would eat a
-  meaningful chunk of that budget. Currently informational only:
-  frontDistanceMM is read and logged in telemetry, but nothing in the
-  control loop reacts to it yet - it does not brake or stop the robot.
+  meaningful chunk of that budget. frontDistanceMM is read and logged in
+  telemetry, and also acted on: below OBSTACLE_STOP_MM (10cm) while
+  driving forward, the control loop hard-stops both wheels for that
+  cycle, bypassing the PID/slew output entirely - see the obstacle-stop
+  block in loop() and OBSTACLE_STOP_MM below. Reversing/pivoting away
+  from an obstacle is still allowed (the stop only applies when
+  targetSpeedMMs > 0), since backing off is exactly what you want to do
+  once something is that close.
 
   WHY THIS SETUP
   --------------
@@ -233,10 +238,15 @@ const int MAX_PWM_STEP_PER_CYCLE = 20;
 const float SLIP_THRESHOLD_MMS = 15.0;
 
 // --- Front ultrasonic sensor (HC-SR04) ---
-// Informational only for now - see loop() and measureFrontDistanceMM().
+// See loop() and measureFrontDistanceMM().
 const unsigned long SENSOR_PERIOD_MS = 100;   // 10Hz, independent of the 20Hz control loop
 const unsigned long ECHO_TIMEOUT_US  = 25000; // bounds pulseIn()'s worst-case block (~4.3m range)
 const float OBSTACLE_WARN_MM         = 300.0; // flagged in telemetry below this range, not acted on
+// Hard safety stop: below this range while driving forward, both wheels
+// are forced to PWM_STOP for the cycle regardless of what PID/slew
+// computed - see the obstacle-stop block in loop(). Only blocks forward
+// motion (targetSpeedMMs > 0); reversing or pivoting away is unaffected.
+const float OBSTACLE_STOP_MM         = 100.0; // 10cm
 
 // --- Slip response (traction control) ---
 // This backs off torque on a side once it's slipping past SLIP_THRESHOLD_MMS.
@@ -351,6 +361,7 @@ void setup() {
   Serial.println("P<value>=set Kp live, e.g. P0.3   K<value>=set Ki live, e.g. K0.1");
   Serial.println("Kp=" + String(Kp) + " Ki=" + String(Ki) + " Kd=" + String(Kd));
   Serial.println("Front ultrasonic (HC-SR04) logged in telemetry as front:<mm>, -1 = no echo.");
+  Serial.println("Hard stop below " + String(OBSTACLE_STOP_MM, 0) + "mm while driving forward.");
   lastControlTime = millis();
 }
 
@@ -455,6 +466,19 @@ void loop() {
     leftPWM  = slewLimit(leftPWM,  lastAppliedLeftPWM);
     rightPWM = slewLimit(rightPWM, lastAppliedRightPWM);
 
+    // Hard safety stop: something's closer than OBSTACLE_STOP_MM and we're
+    // commanding forward motion - override PID/slew output entirely rather
+    // than slewing down to it, and reset lastApplied so the slew limiter
+    // starts clean from a true stop next cycle (see slewLimit()'s exact-
+    // equality note on why that matters). Reversing/turning in place is
+    // left alone since targetSpeedMMs is not > 0 in that case.
+    bool obstacleStop = (frontDistanceMM > 0 && frontDistanceMM < OBSTACLE_STOP_MM &&
+                          targetSpeedMMs > 0);
+    if (obstacleStop) {
+      leftPWM = rightPWM = PWM_STOP;
+      lastAppliedLeftPWM = lastAppliedRightPWM = PWM_STOP;
+    }
+
     saberLeft.writeMicroseconds(leftPWM);
     saberRight.writeMicroseconds(rightPWM);
 
@@ -474,6 +498,7 @@ void loop() {
     if (leftSlip)  line += " [LEFT SLIP]";
     if (rightSlip) line += " [RIGHT SLIP]";
     if (frontDistanceMM > 0 && frontDistanceMM < OBSTACLE_WARN_MM) line += " [OBSTACLE]";
+    if (obstacleStop) line += " [OBSTACLE STOP]";
     Serial.println(line);
   }
 }
